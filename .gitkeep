@@ -1,189 +1,179 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/cmr_renamer.py b/cmr_renamer.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..7313b3b5fa2e052e1749511dd178f82c2f774498
---- /dev/null
-+++ b/cmr_renamer.py
-@@ -0,0 +1,179 @@
-+from __future__ import annotations
-+
-+from dataclasses import dataclass, field, asdict
-+from datetime import datetime, timedelta
-+from pathlib import Path
-+import argparse
-+import json
-+import re
-+import shutil
-+import zipfile
-+from typing import Iterable, List, Optional
-+
-+INVALID_FILENAME_CHARS = r'[<>:"/\\|?*]'
-+
-+
-+def _norm_spaces(s: str) -> str:
-+    return re.sub(r"\s+", " ", s or "").strip()
-+
-+
-+def sanitize_filename_part(s: str) -> str:
-+    s = (s or "").replace("/", "-")
-+    s = re.sub(INVALID_FILENAME_CHARS, "-", s)
-+    return _norm_spaces(s)
-+
-+
-+def parse_date(value: Optional[str]) -> Optional[datetime]:
-+    if not value:
-+        return None
-+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
-+        try:
-+            return datetime.strptime(value.strip(), fmt)
-+        except ValueError:
-+            continue
-+    return None
-+
-+
-+def fmt_date(d: Optional[datetime]) -> str:
-+    return d.strftime("%d.%m.%Y") if d else ""
-+
-+
-+@dataclass
-+class DocumentMeta:
-+    original_name: str
-+    colt_numbers: List[str] = field(default_factory=list)
-+    copl_numbers: List[str] = field(default_factory=list)
-+    sender: str = ""
-+    consignee: str = ""
-+    buyer: str = ""
-+    place_of_delivery: str = ""
-+    destination_address: str = ""
-+    doc_date: Optional[str] = None
-+    is_manifest: bool = False
-+    is_delivery_list: bool = False
-+    is_mobis: bool = False
-+    rotate_180: bool = False
-+    zone24_signed: Optional[bool] = None
-+
-+
-+@dataclass
-+class RenameResult:
-+    source_name: str
-+    target_name: str
-+    rotated_180: bool
-+    zone24_warning: bool
-+
-+
-+class RenamingEngine:
-+    def __init__(self, mobis_rule_enabled: bool = False):
-+        self._seen: dict[str, int] = {}
-+        self.mobis_rule_enabled = mobis_rule_enabled
-+
-+    def _dedupe_token(self, token: str) -> str:
-+        count = self._seen.get(token, 0) + 1
-+        self._seen[token] = count
-+        return token if count == 1 else f"{token}.{count}"
-+
-+    def _dedupe_full(self, base: str) -> str:
-+        count = self._seen.get(base, 0) + 1
-+        self._seen[base] = count
-+        return base if count == 1 else f"{base}.{count}"
-+
-+    def rename(self, doc: DocumentMeta) -> str:
-+        if doc.is_manifest or doc.is_delivery_list:
-+            return doc.original_name
-+
-+        colt = [f"COLT{re.sub(r'\D', '', n)}" for n in doc.colt_numbers if re.sub(r"\D", "", n)]
-+        copl = [f"COPL{re.sub(r'\D', '', n)}" for n in doc.copl_numbers if re.sub(r"\D", "", n)]
-+        if colt or copl:
-+            return f"{' '.join(self._dedupe_token(t) for t in [*colt, *copl])}.pdf"
-+
-+        if doc.is_mobis and not self.mobis_rule_enabled:
-+            return doc.original_name
-+
-+        sender_upper = (doc.sender or "").upper()
-+        consignee = sanitize_filename_part(doc.consignee)
-+        buyer = sanitize_filename_part(doc.buyer)
-+        pod = sanitize_filename_part(doc.place_of_delivery)
-+        destination = sanitize_filename_part(doc.destination_address)
-+        d = parse_date(doc.doc_date)
-+
-+        if "AD BALTIC" in sender_upper or "AD BLATIC" in sender_upper:
-+            base = _norm_spaces(f"AD BALTIC {pod} {fmt_date(d + timedelta(days=1) if d else None)}")
-+            return f"{self._dedupe_full(base)}.pdf"
-+        if "FUTURUS" in sender_upper:
-+            party = consignee or buyer
-+            return f"{self._dedupe_full(_norm_spaces(f'FUTURUS {party} {fmt_date(d)}'))}.pdf"
-+        if "EUROPAPIER" in sender_upper or "EUROPAPIRE" in sender_upper:
-+            return f"{self._dedupe_full(_norm_spaces(f'EUROPAPIER {consignee} {destination}'))}.pdf"
-+        if "PILKINGTON" in sender_upper:
-+            return f"{self._dedupe_full(_norm_spaces(f'Pilkington {fmt_date(d)}'))}.pdf"
-+        if "AGCO" in sender_upper:
-+            return f"{self._dedupe_full(_norm_spaces(f'{consignee} {destination} {fmt_date(d)}'))}.pdf"
-+        return doc.original_name
-+
-+
-+class BatchProcessor:
-+    def __init__(self, engine: Optional[RenamingEngine] = None):
-+        self.engine = engine or RenamingEngine()
-+
-+    @staticmethod
-+    def count_pdf_in_zip(zip_path: str | Path) -> int:
-+        with zipfile.ZipFile(zip_path, "r") as zf:
-+            return sum(1 for n in zf.namelist() if n.lower().endswith(".pdf"))
-+
-+    def process(self, docs: Iterable[DocumentMeta]) -> list[RenameResult]:
-+        out: list[RenameResult] = []
-+        for doc in docs:
-+            out.append(
-+                RenameResult(
-+                    source_name=doc.original_name,
-+                    target_name=self.engine.rename(doc),
-+                    rotated_180=bool(doc.rotate_180 and not (doc.is_manifest or doc.is_delivery_list)),
-+                    zone24_warning=(not doc.is_manifest and not doc.is_delivery_list and doc.zone24_signed is False),
-+                )
-+            )
-+        return out
-+
-+
-+def _load_manifest(path: Path) -> list[DocumentMeta]:
-+    raw = json.loads(path.read_text(encoding="utf-8"))
-+    return [DocumentMeta(**item) for item in raw]
-+
-+
-+def _copy_renamed(input_dir: Path, output_dir: Path, results: list[RenameResult]) -> None:
-+    output_dir.mkdir(parents=True, exist_ok=True)
-+    for r in results:
-+        src = input_dir / r.source_name
-+        dst = output_dir / r.target_name
-+        if not src.exists():
-+            raise FileNotFoundError(f"Missing source PDF: {src}")
-+        shutil.copy2(src, dst)
-+
-+
-+def main() -> None:
-+    parser = argparse.ArgumentParser(description="CMR renamer")
-+    parser.add_argument("--input-dir", required=True)
-+    parser.add_argument("--output-dir", required=True)
-+    parser.add_argument("--manifest", required=True, help="JSON list of DocumentMeta records")
-+    parser.add_argument("--zip", dest="zip_path", help="Optional zip for PDF count precheck")
-+    parser.add_argument("--report", default="report.json")
-+    args = parser.parse_args()
-+
-+    docs = _load_manifest(Path(args.manifest))
-+    bp = BatchProcessor()
-+
-+    if args.zip_path:
-+        zip_pdf_count = bp.count_pdf_in_zip(args.zip_path)
-+        if zip_pdf_count != len(docs):
-+            raise ValueError(f"PDF count mismatch: zip={zip_pdf_count}, manifest={len(docs)}")
-+
-+    results = bp.process(docs)
-+    _copy_renamed(Path(args.input_dir), Path(args.output_dir), results)
-+
-+    report_path = Path(args.output_dir) / args.report
-+    report_path.write_text(json.dumps([asdict(r) for r in results], ensure_ascii=False, indent=2), encoding="utf-8")
-+
-+
-+if __name__ == "__main__":
-+    main()
- 
-EOF
-)
+from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from pathlib import Path
+import argparse
+import json
+import re
+import shutil
+import zipfile
+from typing import Iterable, List, Optional
+
+INVALID_FILENAME_CHARS = r'[<>:"/\\|?*]'
+
+
+def _norm_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def sanitize_filename_part(s: str) -> str:
+    s = (s or "").replace("/", "-")
+    s = re.sub(INVALID_FILENAME_CHARS, "-", s)
+    return _norm_spaces(s)
+
+
+def parse_date(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def fmt_date(d: Optional[datetime]) -> str:
+    return d.strftime("%d.%m.%Y") if d else ""
+
+
+@dataclass
+class DocumentMeta:
+    original_name: str
+    colt_numbers: List[str] = field(default_factory=list)
+    copl_numbers: List[str] = field(default_factory=list)
+    sender: str = ""
+    consignee: str = ""
+    buyer: str = ""
+    place_of_delivery: str = ""
+    destination_address: str = ""
+    doc_date: Optional[str] = None
+    is_manifest: bool = False
+    is_delivery_list: bool = False
+    is_mobis: bool = False
+    rotate_180: bool = False
+    zone24_signed: Optional[bool] = None
+
+
+@dataclass
+class RenameResult:
+    source_name: str
+    target_name: str
+    rotated_180: bool
+    zone24_warning: bool
+
+
+class RenamingEngine:
+    def __init__(self, mobis_rule_enabled: bool = False):
+        self._seen: dict[str, int] = {}
+        self.mobis_rule_enabled = mobis_rule_enabled
+
+    def _dedupe_token(self, token: str) -> str:
+        count = self._seen.get(token, 0) + 1
+        self._seen[token] = count
+        return token if count == 1 else f"{token}.{count}"
+
+    def _dedupe_full(self, base: str) -> str:
+        count = self._seen.get(base, 0) + 1
+        self._seen[base] = count
+        return base if count == 1 else f"{base}.{count}"
+
+    def rename(self, doc: DocumentMeta) -> str:
+        if doc.is_manifest or doc.is_delivery_list:
+            return doc.original_name
+
+        colt = [f"COLT{re.sub(r'\D', '', n)}" for n in doc.colt_numbers if re.sub(r"\D", "", n)]
+        copl = [f"COPL{re.sub(r'\D', '', n)}" for n in doc.copl_numbers if re.sub(r"\D", "", n)]
+        if colt or copl:
+            return f"{' '.join(self._dedupe_token(t) for t in [*colt, *copl])}.pdf"
+
+        if doc.is_mobis and not self.mobis_rule_enabled:
+            return doc.original_name
+
+        sender_upper = (doc.sender or "").upper()
+        consignee = sanitize_filename_part(doc.consignee)
+        buyer = sanitize_filename_part(doc.buyer)
+        pod = sanitize_filename_part(doc.place_of_delivery)
+        destination = sanitize_filename_part(doc.destination_address)
+        d = parse_date(doc.doc_date)
+
+        if "AD BALTIC" in sender_upper or "AD BLATIC" in sender_upper:
+            base = _norm_spaces(f"AD BALTIC {pod} {fmt_date(d + timedelta(days=1) if d else None)}")
+            return f"{self._dedupe_full(base)}.pdf"
+        if "FUTURUS" in sender_upper:
+            party = consignee or buyer
+            return f"{self._dedupe_full(_norm_spaces(f'FUTURUS {party} {fmt_date(d)}'))}.pdf"
+        if "EUROPAPIER" in sender_upper or "EUROPAPIRE" in sender_upper:
+            return f"{self._dedupe_full(_norm_spaces(f'EUROPAPIER {consignee} {destination}'))}.pdf"
+        if "PILKINGTON" in sender_upper:
+            return f"{self._dedupe_full(_norm_spaces(f'Pilkington {fmt_date(d)}'))}.pdf"
+        if "AGCO" in sender_upper:
+            return f"{self._dedupe_full(_norm_spaces(f'{consignee} {destination} {fmt_date(d)}'))}.pdf"
+        return doc.original_name
+
+
+class BatchProcessor:
+    def __init__(self, engine: Optional[RenamingEngine] = None):
+        self.engine = engine or RenamingEngine()
+
+    @staticmethod
+    def count_pdf_in_zip(zip_path: str | Path) -> int:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            return sum(1 for n in zf.namelist() if n.lower().endswith(".pdf"))
+
+    def process(self, docs: Iterable[DocumentMeta]) -> list[RenameResult]:
+        out: list[RenameResult] = []
+        for doc in docs:
+            out.append(
+                RenameResult(
+                    source_name=doc.original_name,
+                    target_name=self.engine.rename(doc),
+                    rotated_180=bool(doc.rotate_180 and not (doc.is_manifest or doc.is_delivery_list)),
+                    zone24_warning=(not doc.is_manifest and not doc.is_delivery_list and doc.zone24_signed is False),
+                )
+            )
+        return out
+
+
+def _load_manifest(path: Path) -> list[DocumentMeta]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return [DocumentMeta(**item) for item in raw]
+
+
+def _copy_renamed(input_dir: Path, output_dir: Path, results: list[RenameResult]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        src = input_dir / r.source_name
+        dst = output_dir / r.target_name
+        if not src.exists():
+            raise FileNotFoundError(f"Missing source PDF: {src}")
+        shutil.copy2(src, dst)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="CMR renamer")
+    parser.add_argument("--input-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--manifest", required=True, help="JSON list of DocumentMeta records")
+    parser.add_argument("--zip", dest="zip_path", help="Optional zip for PDF count precheck")
+    parser.add_argument("--report", default="report.json")
+    args = parser.parse_args()
+
+    docs = _load_manifest(Path(args.manifest))
+    bp = BatchProcessor()
+
+    if args.zip_path:
+        zip_pdf_count = bp.count_pdf_in_zip(args.zip_path)
+        if zip_pdf_count != len(docs):
+            raise ValueError(f"PDF count mismatch: zip={zip_pdf_count}, manifest={len(docs)}")
+
+    results = bp.process(docs)
+    _copy_renamed(Path(args.input_dir), Path(args.output_dir), results)
+
+    report_path = Path(args.output_dir) / args.report
+    report_path.write_text(json.dumps([asdict(r) for r in results], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
